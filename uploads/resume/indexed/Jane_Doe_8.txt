@@ -1,0 +1,20 @@
+Jane Doe
+Senior Backend Engineer
+jane.doe@example.com | (555) 123-4567
+
+SUMMARY
+Backend engineer with 8 years of experience building scalable distributed systems in Python and Go.
+Strong background in cloud infrastructure, API design, and mentoring junior engineers.
+
+EXPERIENCE
+Senior Backend Engineer, Acme Corp (2019 - Present)
+- Designed and built microservices in Python (FastAPI) and Go, deployed on AWS (ECS, Lambda, RDS)
+- Led migration from monolith to event-driven architecture using Kafka
+- Mentored a team of 4 junior engineers
+
+Backend Engineer, Widget Inc (2016 - 2019)
+- Built REST APIs in Django and PostgreSQL
+- Implemented CI/CD pipelines using Jenkins and Docker
+
+SKILLS
+Python, Go, FastAPI, Django, AWS, Kafka, PostgreSQL, Docker, Kubernetes, REST APIs, System Design

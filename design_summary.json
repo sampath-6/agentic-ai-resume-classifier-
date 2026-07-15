@@ -1,0 +1,185 @@
+{
+  "project": {
+    "name": "resume-classifier",
+    "path": "E:/claude-workspace/resume-classifier",
+    "goal": "Upload multiple resumes, query for relevant keywords/skills, retrieve matching resumes, and let the recruiter download the original file by clicking the candidate name.",
+    "python_env": {
+      "venv_path": "E:/claude-workspace/resume-classifier/.venv",
+      "python_version": "3.12 (py -3.12)",
+      "note": "Pinned versions reused from E:/claude-workspace/insurance/claims-assistant/back-end/.venv where compatible (chromadb 0.5.20, fastapi 0.115.0, uvicorn 0.30.6, pypdf 6.14.2, pdfplumber 0.11.10, python-docx 1.2.0, python-dotenv 1.0.1, pydantic 2.9.2, python-multipart 0.0.12). langgraph/langchain-core pins relaxed to >= (0.2.45 / 0.3.34) because langchain-anthropic (new dependency, not in the source venv) requires a newer langchain-core than that project had pinned.",
+      "install_status": "NOT FINISHED - venv created (recreated fresh once after an interrupted install), but `pip install -r requirements.txt` was interrupted twice and never completed. Must be finished before anything can run."
+    },
+    "env_file": {
+      "status": ".env created from .env.example template. User said they would manually paste in ANTHROPIC_API_KEY themselves - verify it's actually filled in before running.",
+      "reference_key_location": "E:/claude-workspace/insurance/claims-assistant/back-end/.env has an existing ANTHROPIC_API_KEY that was identified as a reuse candidate."
+    }
+  },
+
+  "architecture": {
+    "pattern": "Supervisor/Router multi-agent graph (LangGraph StateGraph)",
+    "llm_provider": "Anthropic Claude (model id claude-sonnet-5 by default, via langchain-anthropic ChatAnthropic)",
+    "interface": "FastAPI service",
+    "vector_store": "ChromaDB, PersistentClient, local on-disk",
+    "embedding_function": "chromadb.utils.embedding_functions.DefaultEmbeddingFunction - local ONNX all-MiniLM-L6-v2, free, no API call",
+    "distance_metric": "cosine (Chroma default for this embedding function)",
+    "chunking_strategy": "Whole-document: one composite embedding per resume (skills + role + seniority + summary + full raw text). Resumes are short (1-2 pages) so no chunking needed. Identified upgrade path if precise skill-keyword recall proves insufficient: hybrid whole-doc + separate skills-only vector (reuses classifier's already-extracted skills list, no new LLM call). Section-based / recursive chunking were considered and rejected as not worth the added complexity for this document length.",
+    "memory_design": {
+      "within_single_run": "Annotated[List[...], add] reducers on state fields (raw_texts, parse_failures, classified) so loop iterations accumulate results instead of overwriting them",
+      "short_term_thread_memory": "MemorySaver checkpointer compiled into the graph; every API call gets a fresh thread_id - each request is an independent, inspectable thread",
+      "long_term_cross_session_memory": "Not implemented. LangGraph Store deferred until there is an actual user/session identity concept in the API",
+      "query_conversational_context": "Deliberately stateless - decided against session-based follow-up memory (e.g. 'now narrow to seniors') because there is no session/user concept in the API yet; if ever needed, the client should carry combined query context rather than the server maintaining conversation memory"
+    }
+  },
+
+  "folders": {
+    "inbox": "uploads/resume/ - newly uploaded, unprocessed files land here",
+    "indexed": "uploads/resume/indexed/ - moved here after successful classify + rename + index",
+    "rejected": "uploads/resume/rejected/ - moved here if file size > 2MB",
+    "failed": "uploads/resume/failed/ - moved here if parsing failed after retries exhausted",
+    "note": "This replaces the old data/resumes/ single-folder design from the first draft implementation"
+  },
+
+  "graph": {
+    "framework": "LangGraph StateGraph(GraphState), compiled with a MemorySaver checkpointer",
+    "entry_node": "supervisor",
+
+    "upload_branch": {
+      "nodes": [
+        { "name": "scan_folder", "llm": false, "role": "Lists files currently sitting in the uploads/resume/ inbox. This is the loop's entry and re-entry point." },
+        { "name": "analyzer_agent", "llm": false, "role": "Checks the next file's size on disk against the 2MB cap." },
+        { "name": "ingestion_agent", "llm": false, "role": "Parses file text. First attempt uses pypdf; retry attempt falls back to pdfplumber (more tolerant of odd layouts)." },
+        { "name": "classifier_agent", "llm": true, "role": "Extracts structured fields via Claude with_structured_output: skills, seniority, primary_role, summary, first_name, last_name, years_experience." },
+        { "name": "rename_agent", "llm": false, "role": "Renames the file to Firstname_Lastname_YearsExperience.ext, auto-incrementing a suffix on collision (_2, _3, ...), and moves it into indexed/." },
+        { "name": "indexer_agent", "llm": false, "role": "Builds the composite document text and upserts into Chroma, keyed by resume_id (UUID)." }
+      ],
+      "loops": [
+        {
+          "name": "parse-retry loop",
+          "edge": "ingestion_agent -> ingestion_agent",
+          "condition": "route_after_ingestion: file still failing AND parse_retries < max_parse_retries (default 2)",
+          "behavior": "Switches PDF backend on retry (pypdf -> pdfplumber) rather than blindly repeating; only re-attempts files that are still failing, tracked via state[\"file_paths\"] being overwritten to just the failures"
+        },
+        {
+          "name": "folder-drain loop",
+          "edge": "scan_folder -> analyzer_agent -> ... -> indexer_agent / rejected / failed -> back to scan_folder",
+          "condition": "route_has_work: inbox has files -> keep looping; inbox empty -> END",
+          "behavior": "Processes one file per iteration, moves it out of the inbox to indexed/rejected/failed, then re-scans - so files dropped in mid-run also get picked up, not just the files present when the loop started"
+        }
+      ],
+      "conditional_edges": [
+        { "name": "route_intent", "after": "supervisor", "routes": { "upload": "-> scan_folder path", "query": "-> query_guardrail_agent path" } },
+        { "name": "route_by_size", "after": "analyzer_agent", "routes": { "over_2mb": "move to rejected/, loop back to scan_folder", "under_2mb": "-> ingestion_agent" } },
+        { "name": "route_after_ingestion", "after": "ingestion_agent", "routes": { "retry": "-> ingestion_agent", "continue": "-> classifier_agent", "retries_exhausted": "move to failed/, loop back to scan_folder" } },
+        { "name": "route_has_work", "after": "scan_folder", "routes": { "has_files": "-> analyzer_agent", "empty": "-> END" } }
+      ],
+      "trigger_mechanism": "Synchronous drain-on-upload. The POST /upload endpoint saves the incoming file(s) to the inbox, then invokes the graph starting at scan_folder, which drains the ENTIRE inbox (not just this call's files) before the HTTP response returns. This was chosen over a FastAPI background task or an independent scheduled poller because the loop mechanics inside the graph are identical regardless of trigger, this is the simplest to observe end-to-end, and switching to a background/scheduled trigger later requires only changing where resume_graph.invoke() is called from - not touching the graph itself."
+    },
+
+    "query_branch": {
+      "nodes": [
+        {
+          "name": "query_guardrail_agent",
+          "llm": "conditional - only on a keyword hit",
+          "role": "Deterministic keyword screen against query_text using a plain comma-separated keyword file. Only if a keyword matches does it escalate to a single Claude judge call, which decides whether the match is a genuine problem (prompt injection attempt, or discriminatory/protected-class search intent such as age, gender, or disability-based filtering) versus a false positive (e.g. the word 'senior' as a legitimate job-title term). No keyword hit = skip the LLM entirely and pass straight through."
+        },
+        { "name": "retrieval_agent", "llm": false, "role": "Queries Chroma for the top 20 results (n_results=20). Applies where_filter (e.g. seniority) on the first attempt." },
+        { "name": "synthesizer_agent", "llm": true, "role": "Writes a ranked prose summary of only the top 3-5 matches. The full list of up to 20 fetched results is still returned as structured data in the API response, separate from the narrated subset." }
+      ],
+      "loops": [
+        {
+          "name": "broaden-search loop",
+          "edge": "retrieval_agent -> retrieval_agent",
+          "condition": "route_after_retrieval: retrieved is empty AND broaden_attempts < max_broaden_attempts (default 2)",
+          "behavior": "First pass honors any where_filter (exact metadata match); the retry drops the filter and relies on semantic similarity alone"
+        }
+      ],
+      "conditional_edges": [
+        { "name": "query_guardrail routing", "after": "query_guardrail_agent", "routes": { "pass": "-> retrieval_agent", "reject": "blocked response returned, no search performed" } },
+        { "name": "route_after_retrieval", "after": "retrieval_agent", "routes": { "broaden": "-> retrieval_agent", "synthesize": "-> synthesizer_agent" } }
+      ]
+    }
+  },
+
+  "chroma_design": {
+    "primary_key": "resume_id - a UUID generated once in ingestion_agent at the moment a file is successfully parsed, then threaded unchanged through classifier_agent -> rename_agent -> indexer_agent. Never regenerated even if the file is renamed again later.",
+    "why_not_filename": "Filename is mutable (rename_agent changes it, and can change it again on a future re-classification). Using it as the Chroma document ID would silently orphan the old entry on any rename instead of cleanly updating it, since Chroma upsert keys strictly by ID.",
+    "metadata_fields": ["resume_id", "display_name (e.g. 'John Smith')", "stored_filename (e.g. 'John_Smith_5.pdf')", "skills", "seniority", "primary_role", "years_experience"],
+    "embedded_document_text_shape": "Skills: {skills}\\nRole: {primary_role}\\nSeniority: {seniority}\\nSummary: {summary}\\n\\n{full raw resume text}"
+  },
+
+  "guardrails": {
+    "scope_decision": "Query-side only, not resume-document-side. Scanning every uploaded document with an LLM guardrail would be a real per-file cost at scale; the recruiter's query is small text, so checking it is cheap regardless of corpus size.",
+    "mechanism": "Two layers: (1) a deterministic keyword screen against a plain comma-separated keyword file - zero cost, always runs. (2) An LLM judge call, triggered ONLY on a keyword hit, deciding whether it's a genuine issue or a false positive.",
+    "keyword_file_format": "Plain comma-separated list (no category tagging) - user's explicit preference over category,keyword pairs.",
+    "catches": ["Prompt injection embedded in the query text", "Discriminatory search intent (age / gender / disability / ethnicity-based filtering)", "PII-fishing queries (asking directly for SSN/phone/address instead of searching by role or skill)"],
+    "explicitly_dropped": "PII redaction on the synthesizer's answer text. Dropped because the recruiter downloads and reads the raw resume file directly anyway, so redacting the text summary doesn't meaningfully reduce PII exposure.",
+    "third_party_tools_considered_and_rejected_for_now": {
+      "presidio": "Free, local, regex+NER based, no LLM call - good fit specifically for PII redaction, kept as a later option if that requirement ever returns",
+      "guardrails_ai": "Free library, but per-validator cost varies (some wrap an LLM call) - not needed for these two checks",
+      "nemo_guardrails": "Free library but architecturally built around LLM/embedding calls for its rails - heaviest option, not adopted"
+    }
+  },
+
+  "download_feature": {
+    "endpoint": "GET /api/resumes/{resume_id}/download",
+    "implementation_note": "Deliberately a plain FastAPI route, NOT a LangGraph node - a download has no judgment or branching to make, so wrapping it in the graph would be unnecessary ceremony",
+    "logic": "collection.get(ids=[resume_id]) to fetch metadata -> read stored_filename -> resolve path inside uploads/resume/indexed/ -> return FileResponse",
+    "security_note": "The client only ever sends an opaque UUID, never a filesystem path, which eliminates path-traversal risk entirely for this endpoint (unlike /upload, which must sanitize client-supplied filenames)"
+  },
+
+  "query_response_shape": {
+    "per_match_fields": ["resume_id", "display_name", "seniority", "primary_role", "skills", "download_url (= /api/resumes/{resume_id}/download)"],
+    "answer_field": "Narrative synthesis covering only the top 3-5 matches",
+    "matches_field": "Full list of up to 20 fetched results, meant for the UI to render as a scannable results table with clickable, downloadable names"
+  },
+
+  "resolved_edge_cases": {
+    "rename_collision": "Auto-increment suffix: John_Smith_5.pdf -> John_Smith_5_2.pdf -> John_Smith_5_3.pdf, etc.",
+    "oversized_file_in_a_batch": "Rejected per-file, not per-batch - one oversized file doesn't block the other files uploaded alongside it",
+    "parse_failure_after_retries_exhausted": "Moved to failed/, doesn't block other files in the same batch",
+    "pagination": "Not implemented - top 20 fetched once and returned as a single list. Chroma has no native server-side cursor/offset for vector queries, so true pagination would mean over-fetching and slicing in-memory; decided not worth building until there's evidence recruiters need to look past the top 20 semantic matches"
+  },
+
+  "security_fixes_already_applied_in_current_code": [
+    "Path traversal fix on POST /upload: Path(f.filename).name strips any directory components from the client-supplied filename, plus a resolved-path containment check against resume_dir",
+    "Extension whitelist on POST /upload: only .pdf, .docx, .txt accepted"
+  ],
+
+  "implementation_status": {
+    "files_written_in_first_draft_but_now_superseded_by_this_design": [
+      "app/state.py - needs resume_id, first_name, last_name, years_experience, oversized/failed file tracking, and query-guardrail fields added to GraphState",
+      "app/graph.py - needs a full rewrite: folder-drain loop, new nodes, resume_id threading, query guardrail wiring",
+      "app/agents/ingestion.py - needs resume_id (UUID) generation added on successful parse",
+      "app/agents/classifier.py - needs the ResumeClassification schema extended with first_name, last_name, years_experience",
+      "app/agents/indexer.py - needs resume_id as the Chroma key instead of filename, plus the new metadata shape (display_name, stored_filename)",
+      "app/agents/retrieval.py - needs n_results changed from 5 to 20",
+      "app/agents/synthesizer.py - needs to narrate only the top 3-5 of state[\"retrieved\"] instead of all of it",
+      "app/api/routes.py - needs the upload endpoint changed to trigger the inbox-drain loop, plus a new download endpoint",
+      "app/config.py - needs new settings: uploads dir tree paths (inbox/indexed/rejected/failed), max file size (2MB), guardrail keyword file path, top_k (20), narration_count (5)"
+    ],
+    "files_not_yet_written_at_all": [
+      "app/agents/analyzer.py - new size-check agent",
+      "app/agents/rename.py - new rename + collision-handling + move-to-indexed/ agent",
+      "scan_folder node - planned to live directly in graph.py alongside the existing supervisor function",
+      "app/agents/query_guardrail.py - new keyword screen + gated LLM judge agent",
+      "guardrail keyword config file - plain comma-separated list, path not yet decided (e.g. app/config/guardrail_keywords.txt)"
+    ],
+    "environment_todo": [
+      "Finish `pip install -r requirements.txt` into E:/claude-workspace/resume-classifier/.venv - was interrupted twice; requirements.txt already has the relaxed langgraph/langchain-core pins needed to satisfy langchain-anthropic",
+      "Confirm .env actually has a real ANTHROPIC_API_KEY value pasted in (user said they'd copy it manually from the claims-assistant project's .env)",
+      "Run an end-to-end smoke test: start uvicorn, upload a sample resume, confirm it drains through the loop into Chroma, run a query, confirm the download endpoint works"
+    ]
+  },
+
+  "task_list_snapshot": [
+    { "id": 1, "status": "completed", "subject": "Write config, state, and services (llm, parsing, chroma_store) - this was the ORIGINAL draft version; content now needs updating per this design" },
+    { "id": 2, "status": "pending", "subject": "Rewrite agents for inbox/loop pipeline (analyzer, rename, scan_folder + extend classifier/indexer)" },
+    { "id": 3, "status": "pending", "subject": "Rewrite graph.py: folder-drain loop, resume_id threading, query guardrail wiring" },
+    { "id": 4, "status": "pending", "subject": "Rewrite routes.py: inbox-drain upload trigger + resume_id download endpoint" },
+    { "id": 5, "status": "in_progress", "subject": "requirements.txt, .env.example, and venv setup" },
+    { "id": 6, "status": "pending", "subject": "Smoke test the running service" },
+    { "id": 7, "status": "pending", "subject": "Update state.py and config.py for new pipeline" },
+    { "id": 8, "status": "pending", "subject": "Implement query_guardrail_agent + keyword config file" },
+    { "id": 9, "status": "pending", "subject": "Update retrieval_agent (top 20) and synthesizer_agent (narrate top 5)" }
+  ]
+}
