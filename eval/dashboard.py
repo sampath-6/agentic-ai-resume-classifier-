@@ -35,7 +35,7 @@ def main() -> None:
     ap.add_argument("--hours", type=float, default=24 * 7)
     args = ap.parse_args()
     serve(f"file:{settings.hieevas_trace_path}", port=args.port, hours=args.hours,
-          group_by=("condition",), architecture="resume-graph", scorer=top_match,
+          group_by=("architecture", "condition"), architecture="ui-traffic", scorer=top_match,
           title="Resume classifier – live evaluation (hieevas)")
 
 

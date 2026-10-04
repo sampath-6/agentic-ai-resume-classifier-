@@ -82,8 +82,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--repeats", type=int, default=2, help="send each probe this many times (consistency, M3)")
+    ap.add_argument("--label", default="resume-graph", help="version label shown as the dashboard column, e.g. guardrail-v2")
     args = ap.parse_args()
-    results = hieevas.send_probes(make_sender(args.url), PROBES, architecture="resume-graph", repeats=args.repeats)
+    results = hieevas.send_probes(make_sender(args.url), PROBES, architecture=args.label, repeats=args.repeats)
     for r in results:
         answer = (r["output"] or r["error"] or "").replace("\n", " ")
         print(f"{r['task_id']} {r['condition']} {r['seconds']:5.1f}s  {answer[:110]}")
