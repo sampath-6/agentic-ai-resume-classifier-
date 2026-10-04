@@ -1,6 +1,22 @@
 .venv/
 __pycache__/
 *.pyc
+.env
 chroma_db/
+checkpoints.sqlite
+checkpoints.sqlite-*
+logs/
+
+# uploaded / generated resume files (candidate data — do not commit)
+uploads/
 data/resumes/*
 !data/resumes/.gitkeep
+data/tobeuploaded/*
+!data/tobeuploaded/.gitkeep
+
+# hieevas evaluation traces (contain resume text and queries)
+traces/
+
+# local tool settings and unrelated side project
+.claude/settings.local.json
+insta-reel/

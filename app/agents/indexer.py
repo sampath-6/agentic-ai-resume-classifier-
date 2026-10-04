@@ -28,6 +28,7 @@ def indexer_agent(state: GraphState) -> dict:
             "seniority": classified["seniority"],
             "primary_role": classified["primary_role"],
             "years_experience": classified["years_experience"],
+            "summary": classified["summary"],
         },
     )
 

@@ -1,6 +1,8 @@
+import logging
+import sqlite3
 from pathlib import Path
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 
 from app.agents.analyzer import analyzer_agent
@@ -16,8 +18,11 @@ from app.state import GraphState
 
 _ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
+logger = logging.getLogger("resume.graph")
+
 
 def supervisor(state: GraphState) -> dict:
+    logger.info("supervisor: intent=%s", state.get("intent"))
     return {}
 
 
@@ -26,6 +31,7 @@ def scan_folder(state: GraphState) -> dict:
     files = sorted(
         str(p) for p in inbox.iterdir() if p.is_file() and p.suffix.lower() in _ALLOWED_EXTENSIONS
     )
+    logger.info("scan_folder: %d file(s) remaining in inbox", len(files))
     return {"file_paths": files}
 
 
@@ -128,7 +134,12 @@ def build_graph():
 
     graph.add_edge("synthesizer_agent", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile(checkpointer=_checkpointer)
 
+
+# Persistent checkpointer. check_same_thread=False because FastAPI may dispatch the
+# sync .invoke() from a worker thread; SqliteSaver serializes writes with its own lock.
+_checkpointer_conn = sqlite3.connect(settings.checkpoint_db, check_same_thread=False)
+_checkpointer = SqliteSaver(_checkpointer_conn)
 
 resume_graph = build_graph()
